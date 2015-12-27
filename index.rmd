@@ -27,9 +27,9 @@ pmlTestDF =  read.csv("data/pml-testing.csv" ,
 # str(pmlTrainDF)
 ```
 
-The documentation for the project data consists of a web page and a SIGCHI paper (http://groupware.les.inf.puc-rio.br/public/papers/2013.Velloso.QAR-WLE.pdf). The paper indicates that the measurements were made by three-axis acceleration, gyroscope and magnetometer sensors on each of the arm, glove (fore-arm) and belt of the user as well as on the dumbbell used in the exercise. The authors fit their model to aggregate variables over 2.5s time windows, but this data is valid in only a small percentage (`r round(100*dim(pmlTrainDF[pmlTrainDF$new_window == "yes",])[1]/dim(pmlTrainDF)[1],2)`%) of the training data rows. Therefore, I will use the actual samples for prediction, not aggregate values.
+The documentation for the project data consists of a web page and a SIGCHI paper (http://groupware.les.inf.puc-rio.br/public/papers/2013.Velloso.QAR-WLE.pdf). The paper indicates that the measurements were made by three-axis acceleration, gyroscope and magnetometer sensors on each of the arm, glove (fore-arm) and belt of the user as well as on the dumbbell used in the exercise. The authors fit their model to aggregate variables over 2.5s time windows, but this data is valid in only a small percentage (`r round(100*dim(pmlTrainDF[pmlTrainDF$new_window == "yes",])[1]/dim(pmlTrainDF)[1],2)`%) of the training data rows. Therefore, I will use the actual observations for prediction, not aggregated values.
 
-We see the data is rather messy, with blank fields, fields indicating a divide by 0 error in the original spreadsheet, and actual NA values. After converting all of these to NA, the data columns load as integer, logical or numeric values. We will drop the pure logical columns, which indicate all NA values, the rows corresponding to window aggregate summaries (because as noted above the aggregate data are NA for all but these observations), remaining near-zero-variance predictors, and any remaining highly correlated variables. I eliminate from training the "context" columns giving user name, time stamps, row index, etc. As a side note, a quick look at the test data indicates that perfect performance could be obtained by matching only on this context data (user and time stamp) since the test data appears to be rows extracted from the raw data. Of course, this _is not_ the approach I have chosen!
+We see the data is rather messy, with blank fields, fields indicating a divide by 0 error in the original spreadsheet, and actual NA values. After converting all of these to NA, the data columns load as integer, logical or numeric values. I will drop the pure logical columns, which indicate all NA values, the rows corresponding to window aggregate summaries (because as noted above the aggregate data are NA for all but these observations), remaining near-zero-variance predictors, and any remaining highly correlated variables. I eliminate from training the "context" columns giving user name, time stamps, row index, etc. As a side note, a quick look at the test data indicates that perfect performance could probably be obtained by fitting only to this context data (user and time stamp) since the test data appears to be rows extracted from the raw data. Of course, this _is not_ the approach I have chosen as it would be counter to the spirit of the problem!
 
 For model development, I partitioned the data into subsets with 75% for training and 25% for cross validation.
 ```{r partitionTrainingData, echo = FALSE}
@@ -132,8 +132,6 @@ featurePlot(x = pmlTrainSubsetPreprocessed[,26:45],
 
 Observing the box plots of the remining scaled and centered features, we don't have a strong preference for any of them over the others as many of the features appear to aid in distinguishing the 5 classes of exercise.
 
-We have already removed the highly correlated predictors.
-
 # Model Fitting
 Based on guidance in the SIGGRAPH paper, I used a __random forest__ predictive model. I use all 45 of the remaining predictors for the model as the caret train random forest model approach is capable of doing further feature selection itself. The model is processed in parallel, using all cores on my machine. The training control uses 10 X cross validation on folds created with with caret createFolds function. 
 
@@ -150,7 +148,8 @@ myControl <- trainControl(method='cv',
 modelFit = train(pmlTrainSubsetPreprocessed$classe ~ ., 
                  pmlTrainSubsetPreprocessed, method = "rf", trControl = myControl)
 print(modelFit)
-# varImp(modelFit)
+plot(varImp(modelFit), top = 20, main = "Top 20 model features by importance")
+
 cmIn = confusionMatrix(predict(modelFit, newdata = pmlTrainSubsetPreprocessed), 
                        pmlTrainSubsetPreprocessed$classe)
 # print(cmIn)
