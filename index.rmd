@@ -1,0 +1,192 @@
+---
+title: "Practical Machine Learning Project"
+author: "dmendres"
+date: "December 7, 2015"
+output: html_document
+---
+
+#Introduction
+This document presents the results of the class project for Practical Machine Learning 7 Dec. 2015 version (predmachlearn-035).
+
+##Data Loading, Cleaning and Exploratory Analysis
+```{r DataLoading, echo = FALSE, warning = FALSE}
+
+#packages: caret for learning tools, data.table for better performance (?)
+library(doParallel, quietly = TRUE)
+library(caret, quietly = TRUE)
+
+#for reproducibility
+set.seed(12345)
+#load the data
+oldWd = getwd()
+setwd("C:/Users/DavidMack/Documents/Coursera/RDevelopmentWork")
+
+pmlTrainDF = read.csv("data/pml-training.csv", na.strings = c("", "NA", "#DIV/0!"), header = T)
+pmlTestDF =  read.csv("data/pml-testing.csv" , 
+                      na.strings = c("", "NA", "#DIV/0!"), header = T)
+# str(pmlTrainDF)
+```
+
+The documentation for the project data consists of a web page and a SIGCHI paper (http://groupware.les.inf.puc-rio.br/public/papers/2013.Velloso.QAR-WLE.pdf). The paper indicates that the measurements were made by three-axis acceleration, gyroscope and magnetometer sensors on each of the arm, glove (fore-arm) and belt of the user as well as on the dumbbell used in the exercise. The authors fit their model to aggregate variables over 2.5s time windows, but this data is valid in only a small percentage (`r round(100*dim(pmlTrainDF[pmlTrainDF$new_window == "yes",])[1]/dim(pmlTrainDF)[1],2)`%) of the training data rows. Therefore, I will use the actual samples for prediction, not aggregate values.
+
+We see the data is rather messy, with blank fields, fields indicating a divide by 0 error in the original spreadsheet, and actual NA values. After converting all of these to NA, the data columns load as integer, logical or numeric values. We will drop the pure logical columns, which indicate all NA values, the rows corresponding to window aggregate summaries (because as noted above the aggregate data are NA for all but these observations), remaining near-zero-variance predictors, and any remaining highly correlated variables. I eliminate from training the "context" columns giving user name, time stamps, row index, etc. As a side note, a quick look at the test data indicates that perfect performance could be obtained by matching only on this context data (user and time stamp) since the test data appears to be rows extracted from the raw data. Of course, this _is not_ the approach I have chosen!
+
+For model development, I partitioned the data into subsets with 75% for training and 25% for cross validation.
+```{r partitionTrainingData, echo = FALSE}
+#for model development, we partition our data into 75% training and 25% validation before exposing the model to the project test data
+trainIndex = createDataPartition(pmlTrainDF$classe, p = .75, list = F)
+pmlTrainSubset = pmlTrainDF[trainIndex,]
+pmlValidationSubset = pmlTrainDF[-trainIndex,]
+```
+
+The aggregate values summed in each 2.5s window are flagged by new_window == "yes". These are the only rows with non-NA values for the "aggregate" variables such as max, min, avg, var, stddev, etc. Therefore, I am going to delete the new window rows from the training data, but of course, no observations will be deleted from the validation or test data! I removed the observation context columns from all data sets since these are not valid predictors.
+
+```{r removingNewWindowRows, echo = FALSE}
+pmlTrainSubset = pmlTrainSubset[pmlTrainSubset$new_window != "yes",]
+# we can't remove observations from validation or test data sets! 
+```
+```{r removingContextColumns, echo = FALSE}
+#we don't want to fit the model to X, user name, etc. which are context for each observation
+lastCol = dim(pmlTrainSubset)[2]
+pmlTrainSubset = pmlTrainSubset[,8:lastCol]
+pmlValidationSubset = pmlValidationSubset[,8:lastCol]
+pmlTestData = pmlTestDF[,8:lastCol]
+```
+Then I analyze the remainder of the observation variables for those which have only NA values and remove them from training, validation, and test data sets.
+```{r removingNAColumns, echo = FALSE}
+#which are all-NA?
+allLogicalPredictors = vector("integer",0)
+lastPredictorCol = dim(pmlTrainSubset)[2] - 1
+for (ii in 1:lastPredictorCol) {
+  if (class(pmlTrainSubset[1,ii]) == "logical") {
+    allLogicalPredictors = append(allLogicalPredictors, ii)
+  } else if (anyNA(pmlTrainSubset[,ii])) {
+    allLogicalPredictors = append(allLogicalPredictors, ii)
+  }
+}
+# print("Ignoring all-NA predictors in training, validation and test data:")
+# print(names(pmlTrainSubset)[allLogicalPredictors])
+pmlTrainSubset = pmlTrainSubset[,-allLogicalPredictors]
+pmlValidationSubset = pmlValidationSubset[,-allLogicalPredictors]
+pmlTestData = pmlTestData[,-allLogicalPredictors]
+
+```
+There are no remaining "near zero variance" predictors, as defined by the caret nzvPredictors function. However, we do find some correlated predictors, and remove them.
+```{r predictorAnalysis, echo = FALSE}
+lastPredictorCol = dim(pmlTrainSubset)[2] - 1
+nzvPredictors = nearZeroVar(pmlTrainSubset[,1:lastPredictorCol])
+#so, there are several near-zero variance predictors, remove them.
+# print("near zero value predictors")
+# print(names(pmlTrainSubset)[nzvPredictors])
+if (length(nzvPredictors) > 0) {
+  pmlTrainSubset = pmlTrainSubset[,-nzvPredictors]
+  pmlValidationSubset = pmlValidationSubset[,-nzvPredictors]
+  pmlTestData = pmlTestData[,-nzvPredictors]
+}
+
+lastPredictorCol = dim(pmlTrainSubset)[2] - 1
+pmlCorr = cor(pmlTrainSubset[,1:lastPredictorCol],use = "complete.obs")
+highCorrPredictors = findCorrelation(pmlCorr, 0.90)
+print("Remove high correlation predictors")
+print(names(pmlTrainSubset)[highCorrPredictors])
+# we do have high-correlation predictors, so remove them. 
+pmlTrainSubset = pmlTrainSubset[,-highCorrPredictors]
+pmlValidationSubset = pmlValidationSubset[,-highCorrPredictors]
+pmlTestData = pmlTestData[,-highCorrPredictors]
+```
+
+
+The predictors are then pre-processed to scale and center the values. The same preprocessing object, derived from the training data, must be used to preprocess the training, validation, and test data sets.
+```{r preProcessing, cache = TRUE, echo = FALSE}
+lastPredictorCol = dim(pmlTrainSubset)[2] - 1
+ppTrainSubset = preProcess(pmlTrainSubset)
+pmlTrainSubsetPreprocessed = predict(ppTrainSubset,pmlTrainSubset)
+pmlValidationSubsetPreprocessed = predict(ppTrainSubset,pmlValidationSubset)
+pmlTestDataPreprocessed = predict(ppTrainSubset,pmlTestData)
+# 
+featurePlot(x = pmlTrainSubsetPreprocessed[,1:25],
+            y = pmlTrainSubsetPreprocessed$classe,
+            plot = "box",
+            ## Pass in options to xyplot() to 
+            ## make it prettier
+            scales = list(x = list(relation="free"),
+                          y = list(relation="free")),
+            adjust = 1.5,
+            pch = "|",
+            layout = c(5,5),
+            auto.key = list(columns = 4))
+
+featurePlot(x = pmlTrainSubsetPreprocessed[,26:45],
+            y = pmlTrainSubsetPreprocessed$classe,
+            plot = "box",
+            ## Pass in options to xyplot() to 
+            ## make it prettier
+            scales = list(x = list(relation="free"),
+                          y = list(relation="free")),
+            adjust = 1.5,
+            pch = "|",
+            layout = c(5,5),
+            auto.key = list(columns = 4))
+
+```
+
+Observing the box plots of the remining scaled and centered features, we don't have a strong preference for any of them over the others as many of the features appear to aid in distinguishing the 5 classes of exercise.
+
+We have already removed the highly correlated predictors.
+
+# Model Fitting
+Based on guidance in the SIGGRAPH paper, I used a __random forest__ predictive model. I use all 45 of the remaining predictors for the model as the caret train random forest model approach is capable of doing further feature selection itself. The model is processed in parallel, using all cores on my machine. The training control uses 10 X cross validation on folds created with with caret createFolds function. 
+
+The resulting model (modelFit) is displayed, along with the top 20 (ranked) predictors.
+We display the validation confusion matrix (predicted vs. known classe results in the validation data set):
+```{r buildModel,  echo = FALSE, cache = TRUE}
+#setup to use all my cores
+cl <- makeCluster(detectCores())
+registerDoParallel(cl)
+#setup for cross validation with folds based on the classification
+myControl <- trainControl(method='cv',
+                          index=createFolds(pmlTrainSubsetPreprocessed$classe))
+
+modelFit = train(pmlTrainSubsetPreprocessed$classe ~ ., 
+                 pmlTrainSubsetPreprocessed, method = "rf", trControl = myControl)
+print(modelFit)
+# varImp(modelFit)
+cmIn = confusionMatrix(predict(modelFit, newdata = pmlTrainSubsetPreprocessed), 
+                       pmlTrainSubsetPreprocessed$classe)
+# print(cmIn)
+validationPredictors = predict(modelFit, newdata = pmlValidationSubsetPreprocessed)
+cmOut = confusionMatrix(table(validationPredictors,pmlValidationSubsetPreprocessed$classe))
+print(cmOut)
+testDataPredictors = predict(modelFit, newdata = pmlTestDataPreprocessed)
+testDataResults = data.frame(pmlTestData$problem_id, testDataPredictors)
+
+```
+
+As can be expected, the training data is over-fit, with a in-sample error of 0 (accuracy = `r round(100*cmIn$overall["Accuracy"],1)`%). However, the __out-of-sample error on the validation set__ is a respectable 
+`r round(100*cmOut$overall["Accuracy"],1)`%. 
+
+This result gives us an `r round(100*(cmOut$overall["Accuracy"]^20),1)`% probability of success on all of the 20 test problems. As a closing note, I observed that all of my submitted test data cases validated.
+
+```{r reportResults, echo = FALSE, warning = FALSE}
+# pml_write_files = function(x){
+#   n = length(x)
+#   for(i in 1:n){
+#     filename = paste0("problem_id_",i,".txt")
+#     write.table(x[i],file=filename,quote=FALSE,row.names=FALSE,col.names=FALSE)
+#   }
+# }
+# pml_write_files(testDataPredictors)
+# #counting words
+# library("qdap")
+# words <- function(text){
+#   require(qdap)
+#   if (missing(text)) {
+#     text <- readLines("clipboard", warn = FALSE)  # read from clipboard
+#   }
+#   sum(wc(text), na.rm = TRUE)
+# }
+# 
+# #copy text to clipboard, then:
+# #wc(readLines("clipboard", warn = FALSE))
+# words()
+```
